@@ -8,36 +8,31 @@ from config import *
 
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 
 # ============================================================
-# APP CONFIG
+# APP
 # ============================================================
 
-app = FastAPI(title="PlanetCode Precision Trade Engine V5.5")
+app = FastAPI(
+    title="PlanetCode Precision Trade Engine V5.5"
+)
 
-t = Jinja2Templates(directory="templates")
+# Always resolve templates relative to this file.
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "templates"
+
+t = Jinja2Templates(
+    directory=str(TEMPLATES_DIR)
+)
 
 d = DhanService()
 engine = PrecisionEngine()
 
 
 # ============================================================
-# TIMEZONE
-# ============================================================
-
-# Render server can run in UTC.
-# NSE market timings are based on India Standard Time.
-IST = ZoneInfo("Asia/Kolkata")
-
-
-def now_ist():
-    """Return current India Standard Time."""
-    return datetime.now(IST)
-
-
-# ============================================================
-# SIGNAL STATE
+# GLOBAL STATE
 # ============================================================
 
 signal_history = {
@@ -55,7 +50,21 @@ last_signal_at = {
     "BANKNIFTY": 0
 }
 
-signal_date = now_ist().date()
+
+# ============================================================
+# TIMEZONE
+# ============================================================
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist():
+    """
+    Always return current India time.
+    Render servers commonly run in UTC, so never use
+    naive datetime.now() for NSE timings.
+    """
+    return datetime.now(IST)
 
 
 # ============================================================
@@ -63,33 +72,25 @@ signal_date = now_ist().date()
 # ============================================================
 
 def market_status():
-    """
-    NSE regular market session:
-    09:15 AM IST to 03:40 PM IST
-    Monday-Friday.
-
-    IMPORTANT:
-    Use IST instead of Render/server local time.
-    """
 
     now = now_ist()
 
     current_time = now.time()
 
-    weekday_open = now.weekday() < 5
-
-    session_open = (
-        time(9, 15) <= current_time <= time(15, 40)
+    # NSE regular equity/index derivatives session
+    market_open = (
+        now.weekday() < 5
+        and time(9, 15) <= current_time <= time(15, 40)
     )
-
-    market_open = weekday_open and session_open
 
     return {
         "open": market_open,
         "label": "MARKET OPEN" if market_open else "MARKET CLOSED",
         "time": now.strftime("%H:%M:%S"),
-        "timezone": "Asia/Kolkata",
-        "date": now.strftime("%Y-%m-%d")
+        "date": now.strftime("%Y-%m-%d"),
+        "server_time_ist": now.strftime("%H:%M:%S"),
+        "server_date_ist": now.strftime("%Y-%m-%d"),
+        "timezone": "Asia/Kolkata"
     }
 
 
@@ -98,33 +99,47 @@ def market_status():
 # ============================================================
 
 def entry_window_open():
-    """
-    Fresh trade entry window.
 
-    Default:
-    09:20 AM IST
-    to
-    03:15 PM IST
-    """
+    current_time = now_ist().time()
 
-    now = now_ist().time()
+    start_hour, start_minute = map(
+        int,
+        TRADING_START_TIME.split(":")
+    )
 
-    sh, sm = map(int, TRADING_START_TIME.split(":"))
-    eh, em = map(int, TRADING_END_TIME.split(":"))
+    end_hour, end_minute = map(
+        int,
+        TRADING_END_TIME.split(":")
+    )
 
-    return time(sh, sm) <= now <= time(eh, em)
+    start_time = time(
+        start_hour,
+        start_minute
+    )
+
+    end_time = time(
+        end_hour,
+        end_minute
+    )
+
+    return start_time <= current_time <= end_time
 
 
 # ============================================================
 # DAILY RESET
 # ============================================================
 
+signal_date = now_ist().date()
+
+
 def reset_daily():
+
     global signal_date
 
     today = now_ist().date()
 
     if today != signal_date:
+
         signal_date = today
 
         for symbol in signal_history:
@@ -134,30 +149,37 @@ def reset_daily():
 
 
 # ============================================================
-# SIGNAL GUARD
+# RESULT GUARDS
 # ============================================================
 
-def guarded_result(symbol, r):
+def guarded_result(symbol, result):
 
     reset_daily()
 
     now = now_ist()
 
-    reasons = list(r.get("reasons", []))
+    reasons = list(
+        result.get("reasons", [])
+    )
 
-    action = r.get("action", "NO TRADE")
+    action = result.get(
+        "action",
+        "NO TRADE"
+    )
+
+    status = market_status()
 
     # --------------------------------------------------------
     # MARKET CLOSED
     # --------------------------------------------------------
 
-    if not market_status()["open"]:
+    if not status["open"]:
 
-        r["action"] = "NO TRADE"
-        r["quality"] = "MARKET CLOSED"
+        result["action"] = "NO TRADE"
+        result["quality"] = "MARKET CLOSED"
 
         reasons.append(
-            "outside regular NSE market session (09:15-15:40 IST)"
+            "outside regular NSE market session"
         )
 
     # --------------------------------------------------------
@@ -166,8 +188,8 @@ def guarded_result(symbol, r):
 
     elif not entry_window_open() and action.startswith("BUY"):
 
-        r["action"] = "NO TRADE"
-        r["quality"] = "ENTRY WINDOW CLOSED"
+        result["action"] = "NO TRADE"
+        result["quality"] = "ENTRY WINDOW CLOSED"
 
         reasons.append(
             f"fresh entries allowed only "
@@ -180,66 +202,66 @@ def guarded_result(symbol, r):
 
     elif action.startswith("BUY"):
 
-        # ----------------------------------------------------
-        # SIGNAL COOLDOWN
-        # ----------------------------------------------------
+        current_timestamp = now.timestamp()
 
+        # Same direction cooldown
         if (
             last_action[symbol] == action
-            and now.timestamp() - last_signal_at[symbol]
+            and
+            current_timestamp - last_signal_at[symbol]
             < SIGNAL_COOLDOWN_SECONDS
         ):
 
-            r["action"] = "WAIT"
-            r["quality"] = "SIGNAL COOLDOWN"
+            result["action"] = "WAIT"
+            result["quality"] = "SIGNAL COOLDOWN"
 
             reasons = [
                 "same signal already generated; "
                 "waiting for fresh confirmation"
             ]
 
-        # ----------------------------------------------------
-        # DAILY SIGNAL LIMIT
-        # ----------------------------------------------------
+        # Daily signal limit
+        elif (
+            len(signal_history[symbol])
+            >= MAX_SIGNALS_PER_DAY
+        ):
 
-        elif len(signal_history[symbol]) >= MAX_SIGNALS_PER_DAY:
+            result["action"] = "NO TRADE"
+            result["quality"] = "DAILY SIGNAL LIMIT"
 
-            r["action"] = "NO TRADE"
-            r["quality"] = "DAILY SIGNAL LIMIT"
-
-            reasons = [
+            reasons.append(
                 "daily signal limit reached"
-            ]
-
-        # ----------------------------------------------------
-        # ACCEPT SIGNAL
-        # ----------------------------------------------------
+            )
 
         else:
 
             last_action[symbol] = action
-            last_signal_at[symbol] = now.timestamp()
+            last_signal_at[symbol] = current_timestamp
 
-            signal_history[symbol].append({
-                "time": now.strftime("%H:%M:%S"),
-                "action": action,
-                "score": r.get("score"),
-                "setup": r.get("setup_name")
-            })
+            signal_history[symbol].append(
+                {
+                    "time": now.strftime("%H:%M:%S"),
+                    "action": action,
+                    "score": result.get("score"),
+                    "setup": result.get("setup_name")
+                }
+            )
 
     # --------------------------------------------------------
     # FINAL RESPONSE
     # --------------------------------------------------------
 
-    r["reasons"] = reasons
+    result["reasons"] = reasons
 
-    r["signal_count_today"] = len(
+    result["signal_count_today"] = len(
         signal_history[symbol]
     )
 
-    r["signal_history"] = signal_history[symbol][-8:]
+    result["signal_history"] = signal_history[
+        symbol
+    ][-8:]
 
-    return r
+    return result
 
 
 # ============================================================
@@ -256,10 +278,13 @@ def shutdown():
 
 
 # ============================================================
-# HOME PAGE
+# HOME
 # ============================================================
 
-@app.get("/", response_class=HTMLResponse)
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
 def home(request: Request):
 
     return t.TemplateResponse(
@@ -274,7 +299,7 @@ def home(request: Request):
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/api/health")
@@ -287,7 +312,7 @@ def health():
 
         "dhan_configured": d.configured(),
 
-        # Manual trading only
+        # Safety: no broker order placement
         "auto_trade": False,
 
         "trading_mode": (
@@ -296,20 +321,28 @@ def health():
             else "MANUAL"
         ),
 
-        # Dhan WebSocket status
         "websocket": d.websocket_info(),
 
-        # Market status in IST
-        "market_open": status["open"],
+        "open": status["open"],
+
+        "label": status["label"],
+
+        "time": status["time"],
+
+        "date": status["date"],
+
         "market_status": status["label"],
-        "server_time_ist": status["time"],
-        "server_date_ist": status["date"],
+
+        "server_time_ist": status["server_time_ist"],
+
+        "server_date_ist": status["server_date_ist"],
+
         "timezone": "Asia/Kolkata",
 
-        # Trading window
         "entry_window": entry_window_open(),
 
         "entry_window_start": TRADING_START_TIME,
+
         "entry_window_end": TRADING_END_TIME
     }
 
@@ -324,80 +357,115 @@ def scan(symbol: str):
     symbol = symbol.upper()
 
     # --------------------------------------------------------
-    # SECURITY ID
+    # SYMBOL VALIDATION
     # --------------------------------------------------------
 
     if symbol == "NIFTY":
 
-        sid = NIFTY_SECURITY_ID
+        security_id = NIFTY_SECURITY_ID
 
     elif symbol == "BANKNIFTY":
 
-        sid = BANKNIFTY_SECURITY_ID
+        security_id = BANKNIFTY_SECURITY_ID
 
     else:
 
         raise HTTPException(
             status_code=400,
-            detail="Unsupported symbol"
+            detail="Unsupported symbol. Use NIFTY or BANKNIFTY."
         )
 
     # --------------------------------------------------------
-    # MARKET DATA + STRATEGY
+    # DATA + STRATEGY
     # --------------------------------------------------------
 
     try:
 
-        # Underlying candles
-        f = d.candles(sid)
+        # 1. Underlying candles
+        candles_data = d.candles(
+            security_id
+        )
 
-        # Live WebSocket price
-        live = d.live_price(sid)
+        # 2. Live WebSocket price
+        live = d.live_price(
+            security_id
+        )
 
-        # Current expiry
-        exp = d.expiry(sid)
+        # 3. Current expiry
+        expiry = d.expiry(
+            security_id
+        )
 
-        # Option chain
-        chain = d.chain(sid, exp)
+        # 4. Option chain
+        chain = d.chain(
+            security_id,
+            expiry
+        )
 
-        # Parse option chain
-        spot, rows = d.parse(chain)
+        # 5. Parse option chain
+        spot, option_rows = d.parse(
+            chain
+        )
 
-        # Prefer fresh WebSocket LTP
+        # ----------------------------------------------------
+        # LIVE PRICE OVERRIDE
+        # ----------------------------------------------------
+
         if live:
-            spot = live["ltp"]
 
-        f["spot"] = spot
+            try:
+                live_ltp = float(
+                    live.get("ltp", spot)
+                )
+
+                if live_ltp > 0:
+                    spot = live_ltp
+
+            except Exception:
+                pass
+
+        # ----------------------------------------------------
+        # FEED DATA
+        # ----------------------------------------------------
+
+        candles_data["spot"] = spot
 
         # ----------------------------------------------------
         # STRATEGY ENGINE
         # ----------------------------------------------------
 
-        r = engine.evaluate(
-            f,
-            rows,
+        result = engine.evaluate(
+            candles_data,
+            option_rows,
             lot_lookup=d.lot_size,
             capital=CAPITAL,
             risk_pct=RISK_PCT
         )
 
         # ----------------------------------------------------
-        # SAFETY / MARKET GUARDS
+        # SAFETY GUARDS
         # ----------------------------------------------------
 
-        r = guarded_result(
+        result = guarded_result(
             symbol,
-            r
+            result
         )
 
         # ----------------------------------------------------
         # SESSION MOVE
         # ----------------------------------------------------
 
-        session_open = f.get(
+        session_open = candles_data.get(
             "session_open",
             spot
         )
+
+        try:
+            session_open = float(
+                session_open
+            )
+        except Exception:
+            session_open = float(spot)
 
         session_move = round(
             spot - session_open,
@@ -405,46 +473,39 @@ def scan(symbol: str):
         )
 
         session_pct = round(
-            session_move /
-            max(session_open, 1) *
-            100,
+            (
+                session_move
+                /
+                max(session_open, 1)
+            )
+            * 100,
             2
         )
 
         # ----------------------------------------------------
-        # FINAL RESPONSE
+        # FINAL API RESPONSE
         # ----------------------------------------------------
+
+        current = now_ist()
 
         return {
 
-            # ------------------------------------------------
-            # TIME
-            # ------------------------------------------------
-
-            "timestamp": now_ist().isoformat(
+            "timestamp": current.isoformat(
                 timespec="seconds"
             ),
 
-            "server_time_ist": now_ist().strftime(
+            "server_time_ist": current.strftime(
                 "%H:%M:%S"
             ),
 
             "timezone": "Asia/Kolkata",
 
-            # ------------------------------------------------
-            # SYMBOL
-            # ------------------------------------------------
-
             "symbol": symbol,
 
-            "expiry": exp,
-
-            # ------------------------------------------------
-            # PRICE
-            # ------------------------------------------------
+            "expiry": expiry,
 
             "spot": round(
-                spot,
+                float(spot),
                 2
             ),
 
@@ -458,73 +519,88 @@ def scan(symbol: str):
             "session_pct": session_pct,
 
             # ------------------------------------------------
-            # TECHNICAL DATA
+            # INDICATORS
             # ------------------------------------------------
 
             "vwap": round(
-                f["vwap"],
+                float(candles_data["vwap"]),
                 2
             ),
 
             "ema9": round(
-                f["ema9"],
+                float(candles_data["ema9"]),
                 2
             ),
 
             "ema21": round(
-                f["ema21"],
+                float(candles_data["ema21"]),
                 2
             ),
 
             "rsi": round(
-                f.get("rsi", 50),
+                float(
+                    candles_data.get(
+                        "rsi",
+                        50
+                    )
+                ),
                 1
             ),
 
             "atr": round(
-                f.get("atr", 0),
+                float(
+                    candles_data.get(
+                        "atr",
+                        0
+                    )
+                ),
                 2
             ),
 
             "volume_ratio": round(
-                f.get("volume_ratio", 1),
+                float(
+                    candles_data.get(
+                        "volume_ratio",
+                        1
+                    )
+                ),
                 2
             ),
 
             "short_momentum_pct": round(
-                f.get(
-                    "short_momentum_pct",
-                    0
+                float(
+                    candles_data.get(
+                        "short_momentum_pct",
+                        0
+                    )
                 ),
                 3
             ),
 
-            # ------------------------------------------------
-            # CANDLES
-            # ------------------------------------------------
-
-            "candles": f["candles"],
+            "candles": candles_data[
+                "candles"
+            ],
 
             # ------------------------------------------------
-            # LIVE DATA
+            # LIVE FEED
             # ------------------------------------------------
 
             "live_feed": live,
 
-            "feed_mode":
-                "LIVE WEBSOCKET + REST CONFIRMATION",
+            # ------------------------------------------------
+            # MODE
+            # ------------------------------------------------
 
-            # ------------------------------------------------
-            # TRADING MODE
-            # ------------------------------------------------
+            "mode":
+                "LIVE WEBSOCKET + REST "
+                "CONFIRMATION / MANUAL TRADE",
 
             "auto_trade": False,
 
-            "trading_mode": (
+            "trading_mode":
                 "PAPER"
                 if PAPER_MODE
-                else "MANUAL"
-            ),
+                else "MANUAL",
 
             # ------------------------------------------------
             # RISK
@@ -535,7 +611,7 @@ def scan(symbol: str):
             "risk_pct": RISK_PCT,
 
             # ------------------------------------------------
-            # MARKET
+            # MARKET TIMING
             # ------------------------------------------------
 
             **market_status(),
@@ -553,12 +629,21 @@ def scan(symbol: str):
             # STRATEGY RESULT
             # ------------------------------------------------
 
-            **r
+            **result
         }
+
+    # --------------------------------------------------------
+    # ERROR HANDLING
+    # --------------------------------------------------------
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
+        # Return JSON, never HTML.
+        # This also makes frontend debugging easier.
         raise HTTPException(
             status_code=502,
-            detail=str(e)
+            detail=f"Scan failed for {symbol}: {str(e)}"
         )
