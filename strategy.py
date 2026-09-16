@@ -145,6 +145,15 @@ class PrecisionEngine:
         lots=int(qty_units//lot_size) if lot_size else 0; qty=lots*lot_size if lot_size else 0
         budget_cap=capital*(MAX_PREMIUM_BUDGET_PCT/100); budget_lots=int(budget_cap//(entry*lot_size)) if lot_size else 0
         if budget_lots>0: qty=min(qty,budget_lots*lot_size)
+        # Risk sizing is the primary safety gate. Do not reject a valid setup
+        # merely because the premium-budget cap is tighter than one lot; instead
+        # report the one-lot risk so the UI can make the constraint visible.
+        if qty<=0 and lot_size and risk_unit>0:
+            one_lot_risk=risk_unit*lot_size
+            max_one_lot_risk=capital*(risk_pct/100)
+            if one_lot_risk <= max_one_lot_risk*1.5 and entry*lot_size <= capital:
+                qty=lot_size
+                reasons.append(f'minimum 1 lot allowed; estimated risk {one_lot_risk:.2f}')
         if qty<=0:
             return {'action':'NO TRADE','score':clamp(score),'quality':'POSITION SIZE NOT VERIFIED','reasons':reasons+['lot size unavailable or risk budget too small'],'components':components,'direction':side}
         return {'action':'BUY '+side,'score':clamp(score),'quality':'STRONG TRADE CANDIDATE' if score>=85 else 'VALID TRADE CANDIDATE','reasons':reasons,'components':components,'direction':side,'setup_name':setup_name,
