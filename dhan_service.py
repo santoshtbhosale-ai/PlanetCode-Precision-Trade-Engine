@@ -5,7 +5,6 @@ import struct
 import threading
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -58,7 +57,7 @@ class DhanService:
 
     def expiry(self, sid):
         vals = self.post('/optionchain/expirylist', {'UnderlyingScrip':sid,'UnderlyingSeg':UNDERLYING_SEGMENT}).get('data', [])
-        today = datetime.now(ZoneInfo(TIMEZONE)).date()
+        today = datetime.now().date()
         future = []
         for value in vals:
             try:
@@ -108,7 +107,7 @@ class DhanService:
         return 100 - (100/(1+ag/al))
 
     def candles(self, sid):
-        now = datetime.now(ZoneInfo(TIMEZONE))
+        now = datetime.now()
         start = now.replace(hour=9, minute=15, second=0, microsecond=0)
         data = self.post('/charts/intraday', {'securityId':str(sid),'exchangeSegment':UNDERLYING_SEGMENT,'instrument':'INDEX','interval':'1','oi':False,'fromDate':start.strftime('%Y-%m-%d %H:%M:%S'),'toDate':now.strftime('%Y-%m-%d %H:%M:%S')})
         x=data.get('data',data)
