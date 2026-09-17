@@ -67,3 +67,12 @@ pytest -q tests_strategy.py
 - Manual execution means actual realized P&L is not known to the engine unless a future manual-P&L ledger is added.
 - Option Chain OI/IV/Greeks are snapshot-style confirmations; they are not tick-history by themselves.
 - No profitability or win-rate guarantee is made.
+
+
+V5.6 behavior change: setup score and trade signal are separated. A high CE/PE setup score is not itself a trade. When the score, regime, option spread and live option price pass entry filters, the engine returns BUY CE/BUY PE. Position sizing is reported separately; if one lot exceeds the configured risk budget, the BUY signal is still shown with an explicit risk warning for manual confirmation.
+
+## V6.0 validation layer
+- Historical validation uses Dhan 5-minute underlying candles and tests similar directional setups against a 1 ATR target / 1 ATR stop over the next 12 candles.
+- A BUY signal is blocked unless the historical validation sample meets `HISTORICAL_MIN_SAMPLES` and `HISTORICAL_MIN_HIT_RATE` when the gate is enabled.
+- News context is headline-risk context only; it cannot create a trade by itself.
+- Historical hit-rate is **not** an option-P&L win probability and is not a guarantee of future profit.
