@@ -133,34 +133,40 @@ class PrecisionEngine:
         if side=='CE': return max(highs[-3:])>prev and spot<prev
         return min(lows[-3:])<prev and spot>prev
 
-    def _trade(self,side,score,reasons,components,candidate,lot_size,capital,risk_pct,setup_name):
+    def _trade(self,side,score,reasons,components,candidate,lot_size,capital,risk_pct,setup_name,allow_signal_without_budget=True):
         if not candidate or score<MIN_SETUP_SCORE:
             return {'action':'NO TRADE','score':clamp(score),'quality':'WAIT FOR CONFIRMATION','reasons':reasons,'components':components,'direction':side,'setup_name':setup_name}
         entry=float(candidate.get('ask') or candidate.get('ltp') or 0)
-        if entry<=0 or not isfinite(entry): return {'action':'NO TRADE','score':clamp(score),'quality':'INVALID PRICE','reasons':reasons+['invalid option premium'],'components':components,'direction':side}
-        # Dynamic premium stop: tighter in stronger momentum, wider in weaker setup.
+        if entry<=0 or not isfinite(entry):
+            return {'action':'NO TRADE','score':clamp(score),'quality':'INVALID PRICE','reasons':reasons+['invalid option premium'],'components':components,'direction':side}
+        # Dynamic premium stop and 2R target.
         stop_pct=0.12 if score>=85 else 0.14
         sl=round(entry*(1-stop_pct),2); risk_unit=round(entry-sl,2); target=round(entry+MIN_RR*risk_unit,2)
-        risk_budget=capital*(risk_pct/100); qty_units=int(risk_budget//risk_unit) if risk_unit>0 else 0
-        lots=int(qty_units//lot_size) if lot_size else 0; qty=lots*lot_size if lot_size else 0
-        budget_cap=capital*(MAX_PREMIUM_BUDGET_PCT/100); budget_lots=int(budget_cap//(entry*lot_size)) if lot_size else 0
-        if budget_lots>0: qty=min(qty,budget_lots*lot_size)
-        # Risk sizing is the primary safety gate. Do not reject a valid setup
-        # merely because the premium-budget cap is tighter than one lot; instead
-        # report the one-lot risk so the UI can make the constraint visible.
-        if qty<=0 and lot_size and risk_unit>0:
-            one_lot_risk=risk_unit*lot_size
-            max_one_lot_risk=capital*(risk_pct/100)
-            if one_lot_risk <= max_one_lot_risk*1.5 and entry*lot_size <= capital:
-                qty=lot_size
-                reasons.append(f'minimum 1 lot allowed; estimated risk {one_lot_risk:.2f}')
-        if qty<=0:
-            return {'action':'NO TRADE','score':clamp(score),'quality':'POSITION SIZE NOT VERIFIED','reasons':reasons+['lot size unavailable or risk budget too small'],'components':components,'direction':side}
-        return {'action':'BUY '+side,'score':clamp(score),'quality':'STRONG TRADE CANDIDATE' if score>=85 else 'VALID TRADE CANDIDATE','reasons':reasons,'components':components,'direction':side,'setup_name':setup_name,
-                'strike':candidate['strike'],'option_symbol':candidate.get('symbol'),'security_id':candidate.get('security_id'),'entry':entry,'sl':sl,'target':target,
-                'risk_per_unit':risk_unit,'lot_size':lot_size,'qty':qty,'risk_budget':round(risk_budget,2),'rr':f'1:{MIN_RR:g}'}
+        risk_budget=capital*(risk_pct/100)
+        qty_units=int(risk_budget//risk_unit) if risk_unit>0 else 0
+        lots=int(qty_units//lot_size) if lot_size else 0
+        budget_cap=capital*(MAX_PREMIUM_BUDGET_PCT/100)
+        budget_lots=int(budget_cap//(entry*lot_size)) if lot_size else 0
 
-    def evaluate(self,f,rows,lot_lookup=None,capital=100000,risk_pct=0.5):
+        # A signal is a market decision; position sizing is a separate risk-control decision.
+        # Never hide a valid BUY signal merely because the configured risk budget cannot
+        # afford a full lot. Return 1 lot only when it fits the premium budget, and flag
+        # the risk-budget mismatch clearly for manual confirmation.
+        if lot_size and budget_lots > 0:
+            safe_qty = min(max(lots,1)*lot_size, budget_lots*lot_size)
+            risk_for_one_lot=round(risk_unit*lot_size,2)
+            risk_warning = risk_for_one_lot > risk_budget
+            quality='STRONG TRADE CANDIDATE' if score>=85 else 'VALID TRADE CANDIDATE'
+            if risk_warning:
+                quality += ' • RISK ABOVE CONFIGURED BUDGET'
+                reasons = list(reasons) + [f'1 lot risk ₹{risk_for_one_lot:g} exceeds configured risk budget ₹{risk_budget:g}']
+            return {'action':'BUY '+side,'score':clamp(score),'quality':quality,'reasons':reasons,'components':components,'direction':side,'setup_name':setup_name,
+                    'strike':candidate['strike'],'option_symbol':candidate.get('symbol'),'security_id':candidate.get('security_id'),'entry':entry,'sl':sl,'target':target,
+                    'risk_per_unit':risk_unit,'lot_size':lot_size,'qty':safe_qty,'risk_budget':round(risk_budget,2),'risk_for_one_lot':risk_for_one_lot,'risk_warning':risk_warning,'rr':f'1:{MIN_RR:g}'}
+
+        return {'action':'NO TRADE','score':clamp(score),'quality':'LOT SIZE / PREMIUM BUDGET NOT VERIFIED','reasons':reasons+['lot size or premium budget unavailable; manual verification required'],'components':components,'direction':side,'setup_name':setup_name}
+
+    def evaluate(self,f,rows,lot_lookup=None,capital=100000,risk_pct=0.5,historical=None,news=None):
         spot=float(f.get('spot',0) or 0); regime_info=self._regime(f); regime=regime_info['regime']
         outputs={}
         for side in ('CE','PE'):
@@ -178,13 +184,35 @@ class PrecisionEngine:
             if self._false_breakout(f,side): score-=15; opt_reasons.append('possible false breakout detected')
             score=clamp(score)
             threshold=CHOPPY_MIN_SCORE if regime=='NEUTRAL' else STRONG_TREND_MIN_SCORE if regime.startswith('STRONG') else MIN_SETUP_SCORE
-            valid=score>=threshold and aligned_regime and opt is not None
+            # Trade eligibility is based on the actual market/option confirmations.
+            # Position sizing is handled separately inside _trade so a valid signal is
+            # not incorrectly displayed as NO TRADE just because the configured risk
+            # budget is smaller than one option lot.
+            spread_ok = bool(opt) and float(opt.get('spread_pct',99) or 99) <= MAX_OPTION_SPREAD_PCT
+            price_ok = bool(opt) and float(opt.get('ask') or opt.get('ltp') or 0) > 0
+            hist = (historical or {}).get(side, {})
+            hist_ok = (not HISTORICAL_VALIDATION_ENABLED) or bool(hist.get('qualified'))
+            news_bias = str((news or {}).get('bias','UNKNOWN')).upper()
+            news_risk = bool((news or {}).get('risk_flag',False))
+            news_ok = True
+            if NEWS_VALIDATION_ENABLED and news_bias in ('BULLISH','BEARISH'):
+                news_ok = (side=='CE' and news_bias=='BULLISH') or (side=='PE' and news_bias=='BEARISH')
+            if NEWS_VALIDATION_ENABLED and NEWS_RISK_BLOCK and news_risk:
+                news_ok = False
+            valid=score>=threshold and aligned_regime and opt is not None and spread_ok and price_ok and hist_ok and news_ok
             reasons=base_reasons + best_rs + opt_reasons
-            comps=base_comps + [('Best setup: '+best_name,round(best_setup*0.35), 'pass' if best_setup>=60 else 'wait')] + opt_comps + [('Regime filter',10 if aligned_regime else -15,'pass' if aligned_regime else 'fail')]
+            comps=base_comps + [('Best setup: '+best_name,round(best_setup*0.35), 'pass' if best_setup>=60 else 'wait')] + opt_comps + [('Regime filter',10 if aligned_regime else -15,'pass' if aligned_regime else 'fail'), ('Historical validation', int(hist.get('hit_rate') or 0), 'pass' if hist_ok else 'fail'), ('News context', 5 if news_ok else -5, 'pass' if news_ok else 'fail')]
             if not aligned_regime: reasons.append('direction does not match current market regime')
-            lot=lot_lookup(opt.get('security_id')) if opt and lot_lookup else 0
+            if not spread_ok: reasons.append(f'option spread must be <= {MAX_OPTION_SPREAD_PCT:g}%')
+            if not price_ok: reasons.append('option price unavailable')
+            if HISTORICAL_VALIDATION_ENABLED and not hist_ok: reasons.append(f'historical validation below {HISTORICAL_MIN_HIT_RATE:g}% or insufficient sample')
+            if NEWS_VALIDATION_ENABLED and not news_ok:
+                reasons.append('news/event filter not aligned with this direction')
+            lot=lot_lookup(opt.get('security_id')) if opt and lot_lookup else LOT_SIZE_FALLBACK
             trade=self._trade(side,score,reasons,comps,opt,lot,capital,risk_pct,best_name) if valid else {'action':'NO TRADE','score':score,'quality':'WAIT FOR CONFIRMATION','reasons':reasons,'components':comps,'direction':side,'setup_name':best_name}
             trade['threshold']=threshold; trade['best_setup']=best_name; trade['best_setup_score']=best_setup; trade['candidate']={'strike':opt['strike'],'option_symbol':opt.get('symbol'),'security_id':opt.get('security_id')} if opt else None
+            trade['historical_validation']=hist
+            trade['news_context']={'bias':news_bias,'risk_flag':news_risk,'available':bool((news or {}).get('available',False))}
             outputs[side]=trade
         ce=outputs['CE']; pe=outputs['PE']; ce_score=ce['score']; pe_score=pe['score']
         ce_valid=ce['action'].startswith('BUY'); pe_valid=pe['action'].startswith('BUY')
@@ -195,14 +223,14 @@ class PrecisionEngine:
         elif pe_valid: chosen=pe
         bias='CE' if ce_score>pe_score else 'PE' if pe_score>ce_score else 'NEUTRAL'
         if chosen is None:
-            reason=['CE score: %d/100'%ce_score,'PE score: %d/100'%pe_score]
+            reason=['CE setup score: %d/100'%ce_score,'PE setup score: %d/100'%pe_score]
             if abs(ce_score-pe_score)<5: reason.append('CE/PE scores too close')
             if not ce_valid and not pe_valid: reason.append('no side passed all confirmation filters')
             return {'action':'NO TRADE','score':max(ce_score,pe_score),'quality':'WAIT FOR CONFIRMATION','direction':bias,'current_bias':bias,'regime':regime,'regime_info':regime_info,
                     'reasons':reason,'components':[('CE independent score',ce_score,'pass' if ce_valid else 'wait'),('PE independent score',pe_score,'pass' if pe_valid else 'wait')],
-                    'safety':[f'CE confirmation {"OK" if ce_valid else "missing"}',f'PE confirmation {"OK" if pe_valid else "missing"}',f'Regime: {regime}','No clear directional edge' if not (ce_valid or pe_valid) else 'Both sides need a clear separation'],
-                    'ce_score':ce_score,'pe_score':pe_score,'ce_candidate':ce.get('candidate'),'pe_candidate':pe.get('candidate'),'ce_setup':ce.get('best_setup'),'pe_setup':pe.get('best_setup'),'ce_setup_score':ce.get('best_setup_score'),'pe_setup_score':pe.get('best_setup_score')}
-        chosen.update({'ce_score':ce_score,'pe_score':pe_score,'current_bias':chosen['direction'],'regime':regime,'regime_info':regime_info,
+                    'safety':[f'CE confirmation {"OK" if ce_valid else "missing"}',f'PE confirmation {"OK" if pe_valid else "missing"}',f'Regime: {regime}','No side passed the trade-entry filters' if not (ce_valid or pe_valid) else 'Both sides need a clear separation'],
+                    'ce_score':ce_score,'pe_score':pe_score,'score_type':'SETUP QUALITY SCORE — NOT WIN PROBABILITY','ce_candidate':ce.get('candidate'),'pe_candidate':pe.get('candidate'),'ce_setup':ce.get('best_setup'),'pe_setup':pe.get('best_setup'),'ce_setup_score':ce.get('best_setup_score'),'pe_setup_score':pe.get('best_setup_score'), 'historical_validation': {'CE': ce.get('historical_validation'), 'PE': pe.get('historical_validation')}, 'news_context': news or {}}
+        chosen.update({'ce_score':ce_score,'pe_score':pe_score,'score_type':'SETUP QUALITY SCORE — NOT WIN PROBABILITY','current_bias':chosen['direction'],'regime':regime,'regime_info':regime_info,
                        'ce_candidate':ce.get('candidate'),'pe_candidate':pe.get('candidate'),'ce_setup':ce.get('best_setup'),'pe_setup':pe.get('best_setup'),'ce_setup_score':ce.get('best_setup_score'),'pe_setup_score':pe.get('best_setup_score'),
                        'safety':[f'Regime aligned: {regime}',f'{chosen["direction"]} confirmation passed',f'R:R >= {MIN_RR:g}',f'Spread <= {MAX_OPTION_SPREAD_PCT:g}%']})
         return chosen
